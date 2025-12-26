@@ -1,0 +1,17 @@
+============================================================
+DATA QUALITY REPORT
+============================================================
+
+eia_prices_clean.csv:
+  Rows: 3060
+  Columns: 10
+  Missing values: 0
+  Duplicate rows: 0
+
+datacenters_clean.csv:
+  Rows: 8
+  Columns: 10
+  Missing values: 0
+  Duplicate rows: 0
+
+============================================================
