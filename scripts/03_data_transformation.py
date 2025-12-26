@@ -7,7 +7,17 @@ import psycopg2
 from psycopg2 import sql
 from sqlalchemy import create_engine
 import os
-from config import DB_CONFIG, PROCESSED_DATA_DIR
+import sys
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from config import DB_CONFIG, PROCESSED_DATA_DIR
+except ImportError:
+    print("ERROR: Could not import config.py")
+    sys.exit(1)
+
 
 class DatabaseLoader:
     """Load data into PostgreSQL database"""
@@ -16,11 +26,16 @@ class DatabaseLoader:
         self.db_config = DB_CONFIG
         self.processed_dir = PROCESSED_DATA_DIR
         
-        # Create SQLAlchemy engine for pandas to_sql
-        connection_string = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+        # Create SQLAlchemy engine
+        from urllib.parse import quote_plus
+        password = quote_plus(DB_CONFIG['password'])
+        connection_string = (
+            f"postgresql://{DB_CONFIG['user']}:{password}"
+            f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+        )
         self.engine = create_engine(connection_string)
         
-        # Also create psycopg2 connection for custom queries
+        # Create psycopg2 connection
         self.conn = psycopg2.connect(**self.db_config)
         self.cursor = self.conn.cursor()
     
@@ -31,21 +46,28 @@ class DatabaseLoader:
         # Read cleaned data
         df = pd.read_csv(os.path.join(self.processed_dir, 'datacenters_clean.csv'))
         
-        # Prepare for insertion (remove datacenter_id if exists, it's auto-generated)
-        if 'datacenter_id' in df.columns:
-            df = df.drop('datacenter_id', axis=1)
-        
-        # Rename columns to match database schema
+        # Map CSV columns to database columns
         df = df.rename(columns={
-            'state': 'location_state'
+            'city': 'location_city',
+            'state': 'location_state',
+            'renewable_pct': 'renewable_energy_pct'
         })
         
         # Ensure proper data types
         df['is_ai_focused'] = df['is_ai_focused'].astype(bool)
         df['opening_date'] = pd.to_datetime(df['opening_date'])
         
+        # Select only columns that exist in database
+        columns_to_load = [
+            'name', 'company', 'location_city', 'location_state',
+            'latitude', 'longitude', 'capacity_mw', 'is_ai_focused',
+            'opening_date', 'renewable_energy_pct'
+        ]
+        
+        df_to_load = df[columns_to_load]
+        
         # Load to database
-        rows_inserted = df.to_sql(
+        df_to_load.to_sql(
             'dim_datacenters',
             self.engine,
             if_exists='append',
@@ -62,13 +84,16 @@ class DatabaseLoader:
         df = pd.read_csv(os.path.join(self.processed_dir, 'eia_prices_clean.csv'))
         
         # Get date_ids from dim_date
-        # First, ensure we have the dates
         df['date'] = pd.to_datetime(df['date'])
         
         # For each row, get the corresponding date_id
         prices_with_ids = []
         
-        for _, row in df.iterrows():
+        print(f"  Processing {len(df)} price records...")
+        for idx, row in df.iterrows():
+            if idx % 500 == 0:
+                print(f"  Progress: {idx}/{len(df)}")
+            
             # Get date_id
             self.cursor.execute(
                 "SELECT date_id FROM dim_date WHERE full_date = %s",
@@ -107,12 +132,14 @@ class DatabaseLoader:
     def generate_sample_energy_consumption(self):
         """
         Generate sample energy consumption data for datacenters
-        (In production, this would come from actual monitoring or estimates)
         """
         print("\n⚡ Generating sample energy consumption data...")
         
         # Get all datacenters
-        dc_df = pd.read_sql("SELECT datacenter_id, capacity_mw, is_ai_focused FROM dim_datacenters", self.engine)
+        dc_df = pd.read_sql(
+            "SELECT datacenter_id, capacity_mw, is_ai_focused, renewable_energy_pct FROM dim_datacenters",
+            self.engine
+        )
         
         # Get date range (monthly from 2020-01 to 2024-12)
         dates_df = pd.read_sql(
@@ -126,26 +153,27 @@ class DatabaseLoader:
         
         consumption_records = []
         
+        print(f"  Generating {len(dc_df)} datacenters × {len(dates_df)} months...")
+        
+        import numpy as np
+        
         for _, dc in dc_df.iterrows():
             for _, date in dates_df.iterrows():
                 # Estimate monthly consumption based on capacity
-                # Assume 70-90% capacity utilization
-                # AI datacenters tend to run hotter (85-95%)
-                
+                # AI datacenters run at higher utilization
                 if dc['is_ai_focused']:
-                    utilization = 0.85 + (0.10 * pd.np.random.random())  # 85-95%
-                    pue = 1.15 + (0.15 * pd.np.random.random())  # 1.15-1.30 (better)
+                    utilization = 0.85 + (0.10 * np.random.random())  # 85-95%
+                    pue = 1.15 + (0.15 * np.random.random())  # 1.15-1.30
                 else:
-                    utilization = 0.70 + (0.20 * pd.np.random.random())  # 70-90%
-                    pue = 1.35 + (0.25 * pd.np.random.random())  # 1.35-1.60
+                    utilization = 0.70 + (0.20 * np.random.random())  # 70-90%
+                    pue = 1.35 + (0.25 * np.random.random())  # 1.35-1.60
                 
                 # Monthly consumption (MW * hours in month * utilization)
                 hours_in_month = 730  # Average
                 monthly_consumption = dc['capacity_mw'] * hours_in_month * utilization
                 
-                # Get renewable percentage from datacenter table
-                renewable_query = f"SELECT renewable_energy_pct FROM dim_datacenters WHERE datacenter_id = {dc['datacenter_id']}"
-                renewable_pct = pd.read_sql(renewable_query, self.engine).iloc[0]['renewable_energy_pct']
+                # Calculate renewable energy
+                renewable_pct = dc['renewable_energy_pct'] if pd.notna(dc['renewable_energy_pct']) else 0
                 renewable_mwh = monthly_consumption * (renewable_pct / 100)
                 
                 consumption_records.append({
@@ -188,7 +216,6 @@ class DatabaseLoader:
         # Check for orphaned records
         print("\n  Checking referential integrity...")
         
-        # Check fact_energy_consumption
         self.cursor.execute("""
             SELECT COUNT(*) 
             FROM fact_energy_consumption ec
@@ -236,12 +263,15 @@ class DatabaseLoader:
             
         except Exception as e:
             print(f"\n❌ Error during loading: {e}")
+            import traceback
+            traceback.print_exc()
             self.conn.rollback()
             return False
         
         finally:
             self.cursor.close()
             self.conn.close()
+
 
 if __name__ == "__main__":
     loader = DatabaseLoader()
